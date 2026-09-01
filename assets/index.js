@@ -4,6 +4,7 @@
  * @property {string} name
  * @property {number} mtime
  * @property {number} size
+ * @property {?string} public_url
  */
 
 /**
@@ -16,6 +17,7 @@
  * @property {boolean} allow_delete
  * @property {boolean} allow_search
  * @property {boolean} allow_archive
+ * @property {boolean} allow_share
  * @property {boolean} auth
  * @property {string} user
  * @property {boolean} dir_exists
@@ -461,6 +463,7 @@ function addPath(file, index) {
   let actionMove = "";
   let actionEdit = "";
   let actionView = "";
+  let actionShare = "";
   let isDir = file.path_type.endsWith("Dir");
   if (isDir) {
     url += "/";
@@ -471,10 +474,14 @@ function addPath(file, index) {
       </div>`;
     }
   } else {
+    const downloadUrl = file.public_url || url;
     actionDownload = `
     <div class="action-btn" >
-      <a class="dlwt" href="${url}" title="Download file" download>${ICONS.download}</a>
+      <a id="downloadBtn${index}" class="download-link ${file.public_url ? "" : "dlwt"}" href="${downloadUrl}" title="${file.public_url ? "Download using public URL" : "Download file"}" download>${ICONS.download}</a>
     </div>`;
+    if (DATA.allow_share) {
+      actionShare = `<input type="checkbox" class="share-checkbox" onchange="toggleShare(${index})" id="shareBtn${index}" title="Share publicly for 24 hours" aria-label="Share ${encodedName} publicly for 24 hours" ${file.public_url ? "checked" : ""}>`;
+    }
   }
   if (DATA.allow_delete) {
     if (DATA.allow_upload) {
@@ -492,6 +499,7 @@ function addPath(file, index) {
   let actionCell = `
   <td class="cell-actions">
     ${actionDownload}
+    ${actionShare}
     ${actionView}
     ${actionMove}
     ${actionDelete}
@@ -555,11 +563,12 @@ async function setupAuth() {
 }
 
 function setupDownloadWithToken() {
-  document.querySelectorAll("a.dlwt").forEach(link => {
+  document.querySelectorAll("a.download-link, a.dlwt").forEach(link => {
     link.addEventListener("click", async e => {
-      e.preventDefault();
       try {
         const link = e.currentTarget || e.target;
+        if (!link.classList.contains("dlwt")) return;
+        e.preventDefault();
         const originalHref = link.getAttribute("href");
         const tokengenUrl = new URL(originalHref);
         tokengenUrl.searchParams.set("tokengen", "");
@@ -579,6 +588,36 @@ function setupDownloadWithToken() {
       }
     });
   });
+}
+
+async function toggleShare(index) {
+  const file = DATA.paths[index];
+  if (!file || file.path_type.endsWith("Dir")) return;
+  const $share = document.getElementById(`shareBtn${index}`);
+  $share.disabled = true;
+  try {
+    await checkAuth();
+    const res = await fetch(newUrl(file.name) + "?share", { method: "POST" });
+    await assertResOK(res);
+    file.public_url = res.status === 204 ? null : await res.text();
+
+    const $download = document.getElementById(`downloadBtn${index}`);
+    if (file.public_url) {
+      $download.href = file.public_url;
+      $download.title = "Download using public URL";
+      $download.classList.remove("dlwt");
+    } else {
+      $download.href = newUrl(file.name);
+      $download.title = "Download file";
+      $download.classList.add("dlwt");
+    }
+    $share.checked = !!file.public_url;
+  } catch (err) {
+    $share.checked = !!file.public_url;
+    alert(`Cannot change public sharing for \`${file.name}\`, ${err.message}`);
+  } finally {
+    $share.disabled = false;
+  }
 }
 
 function setupSearch() {

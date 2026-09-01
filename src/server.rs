@@ -37,8 +37,8 @@ use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
 use std::sync::atomic::{self, AtomicBool};
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite};
 use tokio::{fs, io};
@@ -60,7 +60,63 @@ const BUF_SIZE: usize = 65536;
 const EDITABLE_TEXT_MAX_SIZE: u64 = 4194304; // 4M
 const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 const HEALTH_CHECK_PATH: &str = "__dufs__/health";
+const PUBLIC_SHARE_PREFIX: &str = "public";
+const PUBLIC_SHARE_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 pub const MAX_SUBPATHS_COUNT: u64 = 1000;
+
+struct PublicShare {
+    path: PathBuf,
+    expires_at: SystemTime,
+}
+
+#[derive(Default)]
+struct PublicShares {
+    entries: Mutex<HashMap<Uuid, PublicShare>>,
+}
+
+impl PublicShares {
+    fn toggle(&self, path: &Path, now: SystemTime) -> Option<Uuid> {
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|_, share| share.expires_at > now);
+        if let Some(id) = entries
+            .iter()
+            .find_map(|(id, share)| (share.path == path).then_some(*id))
+        {
+            entries.remove(&id);
+            None
+        } else {
+            let id = Uuid::new_v4();
+            entries.insert(
+                id,
+                PublicShare {
+                    path: path.to_path_buf(),
+                    expires_at: now + PUBLIC_SHARE_LIFETIME,
+                },
+            );
+            Some(id)
+        }
+    }
+
+    fn get(&self, id: Uuid, filename: &str, now: SystemTime) -> Option<PathBuf> {
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|_, share| share.expires_at > now);
+        let share = entries.get(&id)?;
+        (get_file_name(&share.path) == filename).then(|| share.path.clone())
+    }
+
+    fn url_for(&self, path: &Path, uri_prefix: &str, now: SystemTime) -> Option<String> {
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|_, share| share.expires_at > now);
+        let id = entries
+            .iter()
+            .find_map(|(id, share)| (share.path == path).then_some(id))?;
+        Some(format!(
+            "{}{PUBLIC_SHARE_PREFIX}/{id}/{}",
+            uri_prefix,
+            encode_uri(get_file_name(path))
+        ))
+    }
+}
 
 pub struct Server {
     args: Args,
@@ -68,6 +124,7 @@ pub struct Server {
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
+    public_shares: PublicShares,
 }
 
 impl Server {
@@ -96,6 +153,7 @@ impl Server {
             single_file_req_paths,
             assets_prefix,
             html,
+            public_shares: PublicShares::default(),
         })
     }
 
@@ -152,6 +210,14 @@ impl Server {
                 return Ok(res);
             }
         };
+
+        if relative_path == PUBLIC_SHARE_PREFIX
+            || relative_path.starts_with(&format!("{PUBLIC_SHARE_PREFIX}/"))
+        {
+            self.handle_public_url(&relative_path, &method, headers, &mut res)
+                .await?;
+            return Ok(res);
+        }
 
         if method == Method::GET
             && self
@@ -272,6 +338,15 @@ impl Server {
         if self.guard_root_contained(path).await {
             self.handle_not_found(&query_params, headers, head_only, &mut res)
                 .await?;
+            return Ok(res);
+        }
+
+        if method == Method::POST && has_query_flag(&query_params, "share") {
+            if is_file {
+                self.handle_toggle_share(path, &mut res)?;
+            } else {
+                status_not_found(&mut res);
+            }
             return Ok(res);
         }
 
@@ -1004,6 +1079,69 @@ impl Server {
         Ok(())
     }
 
+    async fn handle_public_url(
+        &self,
+        relative_path: &str,
+        method: &Method,
+        headers: &HeaderMap<HeaderValue>,
+        res: &mut Response,
+    ) -> Result<()> {
+        if method != Method::GET && method != Method::HEAD {
+            *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+            return Ok(());
+        }
+        let mut parts = relative_path.split('/');
+        let id = parts
+            .next()
+            .filter(|part| *part == PUBLIC_SHARE_PREFIX)
+            .and_then(|_| parts.next())
+            .and_then(|part| Uuid::parse_str(part).ok());
+        let filename = parts.next();
+        if parts.next().is_some() {
+            status_not_found(res);
+            return Ok(());
+        }
+        let path = match id
+            .zip(filename)
+            .and_then(|(id, filename)| self.public_shares.get(id, filename, SystemTime::now()))
+        {
+            Some(path) => path,
+            None => {
+                status_not_found(res);
+                return Ok(());
+            }
+        };
+        if self.guard_root_contained(&path).await
+            || !fs::metadata(&path)
+                .await
+                .map(|meta| meta.is_file())
+                .unwrap_or_default()
+        {
+            status_not_found(res);
+            return Ok(());
+        }
+        self.handle_send_file(&path, headers, method == Method::HEAD, res)
+            .await
+    }
+
+    fn handle_toggle_share(&self, path: &Path, res: &mut Response) -> Result<()> {
+        if let Some(id) = self.public_shares.toggle(path, SystemTime::now()) {
+            let url = format!(
+                "{}{PUBLIC_SHARE_PREFIX}/{id}/{}",
+                self.args.uri_prefix,
+                encode_uri(get_file_name(path))
+            );
+            res.headers_mut()
+                .typed_insert(ContentType::from(mime_guess::mime::TEXT_PLAIN_UTF_8));
+            res.headers_mut()
+                .typed_insert(ContentLength(url.len() as u64));
+            *res.body_mut() = body_full(url);
+        } else {
+            status_no_content(res);
+        }
+        Ok(())
+    }
+
     async fn handle_edit_file(
         &self,
         path: &Path,
@@ -1302,6 +1440,7 @@ impl Server {
             allow_delete: self.args.allow_delete && readwrite,
             allow_search: self.args.allow_search,
             allow_archive: self.args.allow_archive,
+            allow_share: readwrite,
             dir_exists: exist,
             auth: self.args.auth.has_users(),
             user,
@@ -1541,6 +1680,12 @@ impl Server {
             name,
             mtime,
             size,
+            public_url: (!is_dir)
+                .then(|| {
+                    self.public_shares
+                        .url_for(path, &self.args.uri_prefix, SystemTime::now())
+                })
+                .flatten(),
         }))
     }
 }
@@ -1561,6 +1706,7 @@ pub struct IndexData {
     pub allow_delete: bool,
     pub allow_search: bool,
     pub allow_archive: bool,
+    pub allow_share: bool,
     pub dir_exists: bool,
     pub auth: bool,
     pub user: Option<String>,
@@ -1573,6 +1719,7 @@ pub struct PathItem {
     pub name: String,
     pub mtime: u64,
     pub size: u64,
+    pub public_url: Option<String>,
 }
 
 impl PathItem {
@@ -1993,4 +2140,30 @@ where
         }
     }
     paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_share_expires_after_24_hours() {
+        let shares = PublicShares::default();
+        let path = Path::new("/tmp/shared.txt");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let id = shares.toggle(path, now).unwrap();
+
+        assert_eq!(
+            shares.get(
+                id,
+                "shared.txt",
+                now + PUBLIC_SHARE_LIFETIME - Duration::from_secs(1)
+            ),
+            Some(path.to_path_buf())
+        );
+        assert_eq!(
+            shares.get(id, "shared.txt", now + PUBLIC_SHARE_LIFETIME),
+            None
+        );
+    }
 }

@@ -179,7 +179,7 @@ svg {
 }
 
 .paths-table .cell-actions {
-  width: 90px;
+  width: 110px;
   display: flex;
   padding-left: 0.5em;
 }
@@ -226,6 +226,11 @@ svg {
 .action-btn {
   padding-right: 0.3em;
   cursor: pointer;
+}
+
+.share-checkbox {
+  align-self: center;
+  margin: 0 0.3em 0 0;
 }
 
 .uploaders-table {

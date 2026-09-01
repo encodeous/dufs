@@ -186,6 +186,56 @@ fn get_file(server: TestServer) -> Result<(), Error> {
 }
 
 #[rstest]
+fn toggle_public_file(server: TestServer) -> Result<(), Error> {
+    let file_url = format!("{}index.html?share", server.url());
+    let resp = fetch!(b"POST", file_url).send()?;
+    assert_eq!(resp.status(), 200);
+    let public_path = resp.text()?;
+    let parts: Vec<_> = public_path.trim_matches('/').split('/').collect();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0], "public");
+    uuid::Uuid::parse_str(parts[1])?;
+    assert_eq!(parts[2], "index.html");
+
+    let resp = reqwest::blocking::get(server.url().join(&public_path)?)?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "This is index.html");
+
+    let index: Value =
+        serde_json::from_str(&reqwest::blocking::get(format!("{}?json", server.url()))?.text()?)?;
+    let item = index["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "index.html")
+        .unwrap();
+    assert_eq!(item["public_url"], public_path);
+
+    let resp = fetch!(b"POST", format!("{}index.html?share", server.url())).send()?;
+    assert_eq!(resp.status(), 204);
+    let resp = reqwest::blocking::get(server.url().join(&public_path)?)?;
+    assert_eq!(resp.status(), 404);
+    Ok(())
+}
+
+#[rstest]
+fn public_file_bypasses_auth(
+    #[with(&["--auth", "user:pass@/:rw"])] server: TestServer,
+) -> Result<(), Error> {
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{}index.html?share", server.url()))
+        .basic_auth("user", Some("pass"))
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    let public_path = resp.text()?;
+
+    let resp = reqwest::blocking::get(server.url().join(&public_path)?)?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text()?, "This is index.html");
+    Ok(())
+}
+
+#[rstest]
 fn get_file_json(server: TestServer) -> Result<(), Error> {
     let resp = reqwest::blocking::get(format!("{}index.html?json", server.url()))?;
     assert_eq!(resp.status(), 200);
